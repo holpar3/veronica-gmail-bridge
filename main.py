@@ -32,7 +32,8 @@ import base64
 import datetime
 from email.mime.text import MIMEText
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -51,6 +52,11 @@ SCOPES = [
 ]
 
 app = FastAPI(title="Veronica Gmail + Calendar Bridge")
+
+# Open WebUI fetches the OpenAPI spec from the browser (cross-origin) with an
+# auth header, which triggers a CORS preflight. Without this, the home's
+# "Add Connection" test fails before it can even read the spec.
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 def _creds():
@@ -72,9 +78,12 @@ def calendar():
     return build("calendar", "v3", credentials=_creds(), cache_discovery=False)
 
 
-def _guard(key):
-    if key != BRIDGE_API_KEY:
-        raise HTTPException(status_code=401, detail="bad or missing X-Bridge-Key")
+def require_key(authorization: str = Header(None), x_bridge_key: str = Header(None)):
+    # Accept either Open WebUI's Bearer header OR the X-Bridge-Key the test
+    # scripts and README contract use. Either one matching is enough.
+    if authorization == f"Bearer {BRIDGE_API_KEY}" or x_bridge_key == BRIDGE_API_KEY:
+        return
+    raise HTTPException(status_code=401, detail="bad or missing credentials")
 
 
 # ---------------- health ----------------
@@ -107,8 +116,7 @@ def _plain_body(payload):
 
 
 @app.get("/email/search")
-def email_search(q: str = "", max: int = 10, x_bridge_key: str = Header(None)):
-    _guard(x_bridge_key)
+def email_search(q: str = "", max: int = 10, _=Depends(require_key)):
     svc = gmail()
     res = svc.users().messages().list(userId="me", q=q, maxResults=max).execute()
     out = []
@@ -129,8 +137,7 @@ def email_search(q: str = "", max: int = 10, x_bridge_key: str = Header(None)):
 
 
 @app.get("/email/message/{msg_id}")
-def email_message(msg_id: str, x_bridge_key: str = Header(None)):
-    _guard(x_bridge_key)
+def email_message(msg_id: str, _=Depends(require_key)):
     svc = gmail()
     full = svc.users().messages().get(userId="me", id=msg_id, format="full").execute()
     h = full.get("payload", {}).get("headers", [])
@@ -151,8 +158,7 @@ class Draft(BaseModel):
 
 
 @app.post("/email/draft")
-def email_draft(d: Draft, x_bridge_key: str = Header(None)):
-    _guard(x_bridge_key)
+def email_draft(d: Draft, _=Depends(require_key)):
     svc = gmail()
     msg = MIMEText(d.body)
     msg["to"] = d.to
@@ -165,8 +171,7 @@ def email_draft(d: Draft, x_bridge_key: str = Header(None)):
 
 # ---------------- calendar ----------------
 @app.get("/calendar/events")
-def calendar_events(days: int = 7, x_bridge_key: str = Header(None)):
-    _guard(x_bridge_key)
+def calendar_events(days: int = 7, _=Depends(require_key)):
     now = datetime.datetime.utcnow().isoformat() + "Z"
     end = (datetime.datetime.utcnow() + datetime.timedelta(days=days)).isoformat() + "Z"
     svc = calendar()
@@ -193,8 +198,7 @@ class Event(BaseModel):
 
 
 @app.post("/calendar/event")
-def calendar_create(e: Event, x_bridge_key: str = Header(None)):
-    _guard(x_bridge_key)
+def calendar_create(e: Event, _=Depends(require_key)):
     svc = calendar()
     body = {
         "summary": e.summary,
